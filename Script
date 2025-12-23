@@ -1,0 +1,374 @@
+local HttpService = game:GetService("HttpService")
+local TeleportService = game:GetService("TeleportService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local CoreGui = game:GetService("CoreGui")
+local Players = game:GetService("Players")
+local Workspace = game:GetService("Workspace")
+local TweenService = game:GetService("TweenService")
+local RunService = game:GetService("RunService")
+local Lighting = game:GetService("Lighting")
+
+-- COMPATIBILITY
+local http_request = http_request or request or (syn and syn.request) or (fluxus and fluxus.request)
+local setclipboard = setclipboard or toclipboard or function(t) print("Copied: "..t) end
+local writefile = writefile or function(...) end
+local readfile = readfile or function(...) end
+local isfile = isfile or function(...) return false end
+local queue_on_teleport = queue_on_teleport or (syn and syn.queue_on_teleport) or function(...) end
+
+--------------------------------------------------------------------------------
+-- ⚙️ CONFIGURATION
+--------------------------------------------------------------------------------
+local ROOT_URL = "https://robloxbots-6b72f-default-rtdb.firebaseio.com/"
+local DATA_URL = ROOT_URL .. "bot_data.json"
+local BLACKLIST_URL = ROOT_URL .. "server_blacklist/"
+
+-- Updated Config Name to force reset
+local ConfigFile = "CosmicConfig_V21.json"
+local CurrentConfig = { WasHopping = false }
+
+-- 🔮 NEBULA PALETTE
+local C_VOID    = Color3.fromRGB(8, 6, 15)     -- Darkest Background
+local C_GLASS   = Color3.fromRGB(20, 15, 35)   -- Glass Elements
+local C_ACCENT  = Color3.fromRGB(160, 80, 255) -- Neon Violet
+local C_MIST_2  = Color3.fromRGB(0, 200, 255)  -- Cyan
+local C_TEXT    = Color3.fromRGB(255, 255, 255)
+local C_RED     = Color3.fromRGB(255, 60, 80)
+
+local GalaxySeq = ColorSequence.new{
+	ColorSequenceKeypoint.new(0, Color3.fromRGB(85, 0, 255)),
+	ColorSequenceKeypoint.new(0.5, Color3.fromRGB(255, 0, 255)),
+	ColorSequenceKeypoint.new(1, Color3.fromRGB(0, 255, 255))
+}
+
+--------------------------------------------------------------------------------
+-- 💾 FILE SYSTEM
+--------------------------------------------------------------------------------
+local function SaveConfig() pcall(function() writefile(ConfigFile, HttpService:JSONEncode(CurrentConfig)) end) end
+local function LoadConfig() if isfile(ConfigFile) then pcall(function() local d = HttpService:JSONDecode(readfile(ConfigFile)); if d then CurrentConfig = d end end) end end
+LoadConfig()
+
+--------------------------------------------------------------------------------
+-- 🧠 GLOBAL HOPPER LOGIC
+--------------------------------------------------------------------------------
+local EXPIRATION_TIME = 300 -- 5 Minutes
+local MIN_PLAYERS = 4
+local MAX_PLAYERS = 7
+
+local function SaveCurrentServer()
+    local url = BLACKLIST_URL .. game.JobId .. ".json"
+    request({
+        Url = url,
+        Method = "PUT",
+        Headers = {["Content-Type"] = "application/json"},
+        Body = HttpService:JSONEncode({timestamp = os.time()})
+    })
+end
+
+local function GetBlacklist()
+    local response = request({Url = BLACKLIST_URL .. ".json", Method = "GET"})
+    if response.StatusCode == 200 and response.Body ~= "null" then
+        return HttpService:JSONDecode(response.Body)
+    end
+    return {}
+end
+
+local function GetServerList(cursor)
+    local url = "https://games.roblox.com/v1/games/"..game.PlaceId.."/servers/Public?sortOrder=Desc&excludeFullGames=true&limit=100"
+    if cursor then url = url .. "&cursor=" .. cursor end
+    local success, result = pcall(function() return game:HttpGet(url) end)
+    if success then return HttpService:JSONDecode(result) end
+    return nil
+end
+
+local function PerformHop()
+    -- 1. Save Config
+    CurrentConfig.WasHopping = true
+    SaveConfig()
+    
+    -- 2. Queue Restart
+    queue_on_teleport('loadstring(game:HttpGet("https://raw.githubusercontent.com/tienkhanh1/spicy/main/CosmicHubV2.lua"))()')
+    
+    -- 3. Save to Blacklist
+    SaveCurrentServer()
+    
+    print("🔄 Finding Global Smart Server...")
+    
+    task.spawn(function()
+        local cursor = nil
+        while true do
+            local blacklist = GetBlacklist()
+            local currentTime = os.time()
+            local data = GetServerList(cursor)
+            
+            if data and data.data then
+                local servers = data.data
+                for i = #servers, 2, -1 do local j = math.random(i); servers[i], servers[j] = servers[j], servers[i] end
+                
+                local foundServer = nil
+                
+                -- PASS 1
+                for _, srv in ipairs(servers) do
+                    if srv.playing >= MIN_PLAYERS and srv.playing <= MAX_PLAYERS and srv.id ~= game.JobId then
+                        if not blacklist[srv.id] or (currentTime - blacklist[srv.id].timestamp) > EXPIRATION_TIME then
+                            foundServer = srv.id; break
+                        end
+                    end
+                end
+                
+                -- PASS 2
+                if not foundServer then
+                    for _, srv in ipairs(servers) do
+                        if srv.playing < srv.maxPlayers and srv.id ~= game.JobId then
+                            if not blacklist[srv.id] or (currentTime - blacklist[srv.id].timestamp) > EXPIRATION_TIME then
+                                foundServer = srv.id; break
+                            end
+                        end
+                    end
+                end
+                
+                if foundServer then
+                    TeleportService:TeleportToPlaceInstance(game.PlaceId, foundServer, Players.LocalPlayer)
+                    return
+                end
+                
+                cursor = data.nextPageCursor
+                if not cursor then cursor = nil end
+            else
+                task.wait(1)
+            end
+            task.wait(0.5)
+        end
+    end)
+end
+
+--------------------------------------------------------------------------------
+-- 🧠 DATA LOGIC
+--------------------------------------------------------------------------------
+local function IsHighTier(text, thresholdM)
+	if not text then return false end
+	local clean = string.upper(text)
+	if string.find(clean, "B") or string.find(clean, "T") or string.find(clean, "Q") then return true end
+	if string.find(clean, "M") then
+		local num = tonumber(string.match(clean, "[%d%.]+"))
+		if num and num >= thresholdM then return true end
+	end
+	return false
+end
+
+local function SanitizeList(data)
+    local list = {}
+    if type(data) == "table" then
+        for k, v in pairs(data) do if type(v) == "table" and v.name then table.insert(list, v) end end
+        table.sort(list, function(a,b) return (a.timestamp or 0) > (b.timestamp or 0) end)
+    end
+    return list
+end
+
+--------------------------------------------------------------------------------
+-- 🛠️ UI HELPERS
+--------------------------------------------------------------------------------
+local function CreateCorner(p, r) local c = Instance.new("UICorner"); c.CornerRadius = UDim.new(0, r); c.Parent = p; return c end
+local function CreateStroke(p, c, t) local s = Instance.new("UIStroke"); s.Color = c; s.Thickness = t; s.Parent = p; return s end
+
+local function ApplyAnimGradient(p)
+	local g = Instance.new("UIGradient"); g.Color = GalaxySeq; g.Parent = p
+	spawn(function() while p.Parent do TweenService:Create(g, TweenInfo.new(3, Enum.EasingStyle.Linear), {Rotation=360}):Play(); task.wait(3); g.Rotation=0 end end)
+end
+
+local function SpawnMeteor(container)
+	if not container.Visible then return end
+	local m = Instance.new("Frame"); m.BackgroundColor3 = Color3.fromRGB(200,200,255); m.BorderSizePixel = 0; m.Size = UDim2.new(0, 2, 0, 40); m.Rotation = 35; m.ZIndex = 5; m.Parent = container
+	local startX = math.random(0, 400); m.Position = UDim2.new(0, startX, 0, -60)
+	local g = Instance.new("UIGradient"); g.Rotation = -90; g.Transparency = NumberSequence.new{NumberSequenceKeypoint.new(0,0), NumberSequenceKeypoint.new(1,1)}; g.Parent = m
+	local duration = math.random(10, 20) / 10; local targetPos = UDim2.new(0, startX - 200, 1.2, 0)
+	local tw = TweenService:Create(m, TweenInfo.new(duration, Enum.EasingStyle.Linear), {Position = targetPos})
+	tw:Play(); tw.Completed:Connect(function() m:Destroy() end)
+end
+
+--------------------------------------------------------------------------------
+-- 🖥️ GUI CONSTRUCTION
+--------------------------------------------------------------------------------
+if CoreGui:FindFirstChild("CosmicHubV21") then CoreGui.CosmicHubV21:Destroy() end
+
+local ScreenGui = Instance.new("ScreenGui")
+ScreenGui.Name = "CosmicHubV21"
+ScreenGui.Parent = CoreGui
+ScreenGui.ResetOnSpawn = false
+ScreenGui.DisplayOrder = 10 -- FORCE ON TOP
+
+-- 📱 MAIN CONTAINER (TALL)
+local MainContainer = Instance.new("Frame")
+MainContainer.Size = UDim2.new(0, 340, 0, 550)
+MainContainer.Position = UDim2.new(0.5, 0, 0.5, 0)
+MainContainer.AnchorPoint = Vector2.new(0.5, 0.5)
+MainContainer.BackgroundTransparency = 1
+MainContainer.Visible = false
+MainContainer.Parent = ScreenGui
+
+local Scaler = Instance.new("UIScale"); Scaler.Parent = MainContainer
+
+-- BACKGROUND
+local MainBg = Instance.new("Frame")
+MainBg.Size = UDim2.new(1, 0, 1, 0)
+MainBg.BackgroundColor3 = C_VOID
+MainBg.Parent = MainContainer
+CreateCorner(MainBg, 20)
+local MainStroke = CreateStroke(MainBg, C_ACCENT, 3); ApplyAnimGradient(MainStroke)
+
+local StarBg = Instance.new("ImageLabel")
+StarBg.Size = UDim2.new(1, 0, 1, 0)
+StarBg.BackgroundTransparency = 1
+StarBg.Image = "rbxassetid://6444300599" 
+StarBg.ImageTransparency = 0.6 
+StarBg.ScaleType = Enum.ScaleType.Crop
+StarBg.Parent = MainBg
+CreateCorner(StarBg, 20)
+
+local MeteorMask = Instance.new("Frame")
+MeteorMask.Size = UDim2.new(1, 0, 1, 0); MeteorMask.BackgroundTransparency = 1; MeteorMask.ClipsDescendants = true; MeteorMask.Parent = MainBg
+task.spawn(function() while ScreenGui.Parent do if MainContainer.Visible then SpawnMeteor(MeteorMask) end task.wait(0.3) end end)
+
+local function UpdateScale()
+	if not Workspace.CurrentCamera then return end
+	local vp = Workspace.CurrentCamera.ViewportSize
+	local targetHeight = 580
+	local scale = 1
+	if vp.Y < targetHeight then scale = vp.Y / targetHeight * 0.9 end
+	Scaler.Scale = scale
+end
+RunService.RenderStepped:Connect(UpdateScale)
+
+-- DRAGGING
+local dragging, dragStart, startPos
+MainContainer.InputBegan:Connect(function(i) if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then dragging = true; dragStart = i.Position; startPos = MainContainer.Position; i.Changed:Connect(function() if i.UserInputState == Enum.UserInputState.End then dragging = false end end) end end)
+MainContainer.InputChanged:Connect(function(i) if (i.UserInputType == Enum.UserInputType.MouseMovement or i.UserInputType == Enum.UserInputType.Touch) and dragging then local d = i.Position - dragStart; MainContainer.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + d.X, startPos.Y.Scale, startPos.Y.Offset + d.Y) end end)
+
+-- UI ELEMENTS
+local TopBar = Instance.new("Frame"); TopBar.Size = UDim2.new(1, 0, 0, 60); TopBar.BackgroundTransparency = 1; TopBar.Parent = MainBg
+local Title = Instance.new("TextLabel"); Title.Text = "COSMIC FINDER"; Title.Font = Enum.Font.FredokaOne; Title.TextSize = 32; Title.TextColor3 = C_TEXT
+Title.Size = UDim2.new(1, -50, 1, 0); Title.Position = UDim2.new(0, 20, 0, 0); Title.BackgroundTransparency = 1; Title.TextXAlignment = 0; Title.Parent = TopBar
+local TS = CreateStroke(Title, C_ACCENT, 1); TS.Transparency=0.5; ApplyAnimGradient(Title)
+
+local CloseBtn = Instance.new("TextButton"); CloseBtn.Size = UDim2.new(0, 35, 0, 35); CloseBtn.Position = UDim2.new(1, -45, 0.5, -17); CloseBtn.BackgroundColor3 = C_GLASS
+CloseBtn.Text = "×"; CloseBtn.TextColor3 = C_ACCENT; CloseBtn.Font = Enum.Font.GothamBlack; CloseBtn.TextSize = 24; CloseBtn.Parent = TopBar
+CreateCorner(CloseBtn, 10); CreateStroke(CloseBtn, C_ACCENT, 1)
+
+local TabC = Instance.new("Frame"); TabC.Size = UDim2.new(1, -30, 0, 40); TabC.Position = UDim2.new(0, 15, 0, 60); TabC.BackgroundTransparency = 1; TabC.Parent = MainBg
+local Tab1 = Instance.new("TextButton"); Tab1.Size = UDim2.new(0.5, -5, 1, 0); Tab1.BackgroundColor3 = C_ACCENT; Tab1.Text = "BRAINROTS"; Tab1.Font = Enum.Font.GothamBold; Tab1.TextColor3 = Color3.new(0,0,0); Tab1.Parent = TabC; CreateCorner(Tab1, 8)
+local Tab2 = Instance.new("TextButton"); Tab2.Size = UDim2.new(0.5, -5, 1, 0); Tab2.Position = UDim2.new(0.5, 5, 0, 0); Tab2.BackgroundColor3 = C_GLASS; Tab2.Text = "MISC"; Tab2.Font = Enum.Font.GothamBold; Tab2.TextColor3 = C_TEXT; Tab2.Parent = TabC; CreateCorner(Tab2, 8); CreateStroke(Tab2, C_ACCENT, 1)
+
+local Page1 = Instance.new("ScrollingFrame"); Page1.Size = UDim2.new(1, -20, 1, -120); Page1.Position = UDim2.new(0, 10, 0, 110); Page1.BackgroundTransparency = 1; Page1.ScrollBarThickness = 2; Page1.Parent = MainBg
+local P1L = Instance.new("UIListLayout"); P1L.Parent = Page1; P1L.Padding = UDim.new(0, 10)
+local Page2 = Instance.new("Frame"); Page2.Size = UDim2.new(1, -20, 1, -120); Page2.Position = UDim2.new(0, 10, 0, 110); Page2.BackgroundTransparency = 1; Page2.Visible = false; Page2.Parent = MainBg
+
+Tab1.MouseButton1Click:Connect(function() Tab1.BackgroundColor3=C_ACCENT; Tab1.TextColor3=Color3.new(0,0,0); if Tab1:FindFirstChild("UIStroke") then Tab1.UIStroke:Destroy() end; Tab2.BackgroundColor3=C_GLASS; Tab2.TextColor3=C_TEXT; CreateStroke(Tab2, C_ACCENT, 1); Page1.Visible=true; Page2.Visible=false end)
+Tab2.MouseButton1Click:Connect(function() Tab2.BackgroundColor3=C_ACCENT; Tab2.TextColor3=Color3.new(0,0,0); if Tab2:FindFirstChild("UIStroke") then Tab2.UIStroke:Destroy() end; Tab1.BackgroundColor3=C_GLASS; Tab1.TextColor3=C_TEXT; CreateStroke(Tab1, C_ACCENT, 1); Page2.Visible=true; Page1.Visible=false end)
+
+local ManBtn = Instance.new("TextButton")
+ManBtn.Size = UDim2.new(1, 0, 0, 60); ManBtn.BackgroundColor3 = C_ACCENT; ManBtn.Text = "MANUAL SERVERHOP"; ManBtn.Font = Enum.Font.GothamBold; ManBtn.TextSize = 20; ManBtn.TextColor3 = Color3.new(0,0,0); ManBtn.Parent = Page2
+CreateCorner(ManBtn, 12)
+ManBtn.MouseButton1Click:Connect(function() ManBtn.Text = "HOPPING..."; PerformHop() end)
+
+--------------------------------------------------------------------------------
+-- 🪐 TOGGLE BUTTON
+--------------------------------------------------------------------------------
+local ToggleBtn = Instance.new("ImageButton")
+ToggleBtn.Name = "ToggleGalaxy"
+ToggleBtn.Size = UDim2.new(0, 65, 0, 65)
+ToggleBtn.Position = UDim2.new(0.05, 0, 0.4, 0)
+ToggleBtn.BackgroundColor3 = C_VOID
+ToggleBtn.Image = "rbxassetid://14264639966"
+ToggleBtn.Parent = ScreenGui
+ToggleBtn.Visible = false
+ToggleBtn.Active = true
+CreateCorner(ToggleBtn, 100)
+local TogStroke = CreateStroke(ToggleBtn, C_ACCENT, 3); ApplyAnimGradient(TogStroke)
+
+CloseBtn.MouseButton1Click:Connect(function() MainContainer.Visible = false; ToggleBtn.Visible = true; ToggleBtn:TweenSize(UDim2.new(0, 65, 0, 65), "Out", "Elastic", 0.6) end)
+ToggleBtn.MouseButton1Click:Connect(function() ToggleBtn:TweenSize(UDim2.new(0,0,0,0), "In", "Back", 0.3, true, function() ToggleBtn.Visible = false; MainContainer.Visible = true end) end)
+
+local td, tstart, tpos
+ToggleBtn.InputBegan:Connect(function(i) if i.UserInputType==Enum.UserInputType.MouseButton1 or i.UserInputType==Enum.UserInputType.Touch then td=true; tstart=i.Position; tpos=ToggleBtn.Position; i.Changed:Connect(function() if i.UserInputState==Enum.UserInputState.End then td=false end end) end end)
+ToggleBtn.InputChanged:Connect(function(i) if (i.UserInputType==Enum.UserInputType.MouseMovement or i.UserInputType==Enum.UserInputType.Touch) and td then local d = i.Position - tstart; ToggleBtn.Position = UDim2.new(tpos.X.Scale, tpos.X.Offset + d.X, tpos.Y.Scale, tpos.Y.Offset + d.Y) end end)
+
+--------------------------------------------------------------------------------
+-- 🚀 REHOP PROMPT (ZINDEX FIXED)
+--------------------------------------------------------------------------------
+local function ShowRehopPrompt()
+	-- Blur Effect
+	local Blur = Instance.new("BlurEffect"); Blur.Size = 24; Blur.Parent = Lighting
+	
+	local PF = Instance.new("Frame"); PF.Size = UDim2.new(0, 280, 0, 160); PF.Position = UDim2.new(0.5,0,0.5,0); PF.AnchorPoint = Vector2.new(0.5,0.5); PF.BackgroundColor3 = C_VOID
+	PF.ZIndex = 100 -- FORCE ON TOP
+	PF.Parent = ScreenGui; CreateCorner(PF, 16); CreateStroke(PF, C_ACCENT, 3)
+	
+	local T = Instance.new("TextLabel"); T.Text="HOP AGAIN?"; T.Size=UDim2.new(1,0,0,40); T.BackgroundTransparency=1; T.Font=Enum.Font.FredokaOne; T.TextSize=24; T.TextColor3=C_ACCENT; T.Parent=PF; T.ZIndex=101
+	local D = Instance.new("TextLabel"); D.Text="Continue Hopping?"; D.Size=UDim2.new(1,0,0,30); D.Position=UDim2.new(0,0,0,40); D.BackgroundTransparency=1; D.Font=Enum.Font.GothamBold; D.TextSize=14; D.TextColor3=C_TEXT; D.Parent=PF; D.ZIndex=101
+	
+	local Y = Instance.new("TextButton"); Y.Size=UDim2.new(0.45,0,0,40); Y.Position=UDim2.new(0.03,0,1,-50); Y.BackgroundColor3=C_ACCENT; Y.Text="YES"; Y.Font=Enum.Font.GothamBold; Y.TextColor3=Color3.new(0,0,0); Y.Parent=PF; CreateCorner(Y,8); Y.ZIndex=101
+	local N = Instance.new("TextButton"); N.Size=UDim2.new(0.45,0,0,40); N.Position=UDim2.new(0.52,0,1,-50); N.BackgroundColor3=C_GLASS; N.Text="NO"; N.Font=Enum.Font.GothamBold; N.TextColor3=C_TEXT; N.Parent=PF; CreateCorner(N,8); CreateStroke(N, C_ACCENT, 1); N.ZIndex=101
+	
+	Y.MouseButton1Click:Connect(function() Blur:Destroy(); PF:Destroy(); PerformHop() end)
+	N.MouseButton1Click:Connect(function() CurrentConfig.WasHopping=false; SaveConfig(); Blur:Destroy(); PF:Destroy(); MainContainer.Visible=true end)
+end
+
+-- INITIAL CHECK
+if CurrentConfig.WasHopping then 
+	MainContainer.Visible=false 
+	ShowRehopPrompt() 
+else 
+	MainContainer.Visible=true 
+end
+
+--------------------------------------------------------------------------------
+-- 🔔 NOTIFICATIONS
+--------------------------------------------------------------------------------
+local NotifyContainer = Instance.new("Frame"); NotifyContainer.Size = UDim2.new(0, 300, 1, 0); NotifyContainer.Position = UDim2.new(0, 20, 0, -20); NotifyContainer.BackgroundTransparency = 1; NotifyContainer.Parent = ScreenGui
+local NotifyLayout = Instance.new("UIListLayout"); NotifyLayout.Parent = NotifyContainer; NotifyLayout.VerticalAlignment = Enum.VerticalAlignment.Bottom; NotifyLayout.Padding = UDim.new(0, 10)
+
+local function ShowNotification(title, desc, isRainbow)
+	local N = Instance.new("Frame"); N.Size = UDim2.new(0, 250, 0, 65); N.BackgroundColor3 = C_GLASS; N.BackgroundTransparency = 0.1; N.Parent = NotifyContainer; CreateCorner(N, 8)
+	local s = CreateStroke(N, isRainbow and Color3.new(1,1,1) or C_ACCENT, 2); if isRainbow then ApplyAnimGradient(s) end
+	local T = Instance.new("TextLabel"); T.Text = title; T.Font = Enum.Font.GothamBold; T.TextColor3 = isRainbow and Color3.new(1,1,1) or C_ACCENT; T.TextSize = 14; T.Size = UDim2.new(1,-20,0,25); T.Position = UDim2.new(0,10,0,5); T.BackgroundTransparency = 1; T.TextXAlignment = 0; T.Parent = N; if isRainbow then ApplyAnimGradient(T) end
+	local DS = Instance.new("TextLabel"); DS.Text = desc; DS.Font = Enum.Font.GothamBold; DS.TextColor3 = C_TEXT; DS.TextSize = 12; DS.Size = UDim2.new(1,-20,0,25); DS.Position = UDim2.new(0,10,0,30); DS.BackgroundTransparency = 1; DS.TextXAlignment = 0; DS.Parent = N
+	task.delay(5, function() if N.Parent then N:Destroy() end end)
+end
+
+--------------------------------------------------------------------------------
+-- 🔄 DATA LOOP
+--------------------------------------------------------------------------------
+local lastDataStr = ""; local lastNotifTime = os.time()
+print("🔮 COSMIC HUB V21 READY")
+
+spawn(function()
+	while ScreenGui.Parent do
+		local success, response = pcall(function() return http_request({Url = FIREBASE_URL, Method = "GET"}) end)
+		if success and response.StatusCode == 200 and response.Body ~= lastDataStr and response.Body ~= "null" then
+			lastDataStr = response.Body
+			local data = HttpService:JSONDecode(response.Body)
+			for _, v in pairs(Page1:GetChildren()) do if v:IsA("Frame") then v:Destroy() end end
+			local list = SanitizeList(data); local maxTime = lastNotifTime
+			local count = 0
+			
+			for _, pet in ipairs(list) do
+				local age = os.time() - (pet.timestamp or 0)
+				if age < 35 and count < 8 then -- LIMIT 8
+					count = count + 1
+					local isRainbow = IsHighTier(pet.gen, 50)
+					local Card = Instance.new("Frame"); Card.Size = UDim2.new(1, -10, 0, 95); Card.BackgroundColor3 = C_GLASS; Card.Parent = Page1; CreateCorner(Card, 10)
+					local s = CreateStroke(Card, isRainbow and Color3.new(1,1,1) or C_ACCENT, 2); if isRainbow then ApplyAnimGradient(s) end
+					local NM = Instance.new("TextLabel"); NM.Text=pet.name; NM.Font=Enum.Font.GothamBold; NM.TextColor3=C_TEXT; NM.Size=UDim2.new(1,-20,0,20); NM.Position=UDim2.new(0,10,0,10); NM.BackgroundTransparency=1; NM.TextXAlignment=0; NM.TextSize=16; NM.Parent=Card
+					local ST = Instance.new("TextLabel"); ST.Text="Stats: "..pet.gen; ST.Font=Enum.Font.GothamBold; ST.TextColor3=isRainbow and Color3.new(1,1,1) or C_ACCENT; ST.Size=UDim2.new(1,-20,0,20); ST.Position=UDim2.new(0,10,0,30); ST.BackgroundTransparency=1; ST.TextXAlignment=0; ST.TextSize=14; ST.Parent=Card; if isRainbow then ApplyAnimGradient(ST) end
+					local BTN = Instance.new("TextButton"); BTN.Text="JOIN"; BTN.Size=UDim2.new(0,80,0,35); BTN.Position=UDim2.new(1,-90,1,-45); BTN.BackgroundColor3=C_ACCENT; BTN.TextColor3=Color3.new(0,0,0); BTN.Font=Enum.Font.GothamBold; BTN.TextSize=12; BTN.Parent=Card; CreateCorner(BTN, 6)
+					BTN.MouseButton1Click:Connect(function() TeleportService:TeleportToPlaceInstance(pet.place, pet.job, Players.LocalPlayer) end)
+					
+					if (pet.timestamp or 0) > lastNotifTime then ShowNotification("FOUND: "..pet.name, pet.gen, isRainbow); if (pet.timestamp or 0) > maxTime then maxTime = pet.timestamp end end
+					spawn(function() while age < 35 and Card.Parent do age=os.time()-(pet.timestamp or 0); task.wait(1) end; if Card.Parent then Card:Destroy() end end)
+				end
+			end
+			lastNotifTime = maxTime
+		end
+		task.wait(1)
+	end
+end)
